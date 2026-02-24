@@ -18,6 +18,9 @@ interface EksStackProps extends StackProps {
   cloudwatchAddonRoleProp: RoleProps,
   rdsClusterEndpoint: string,
   rdsSecurityGroupId: string,
+  awsApplicationTag: string,
+  rumIdentityPoolId: string,
+  rumAppMonitorId: string
 }
 
 export class EksStack extends Stack {
@@ -43,6 +46,8 @@ export class EksStack extends Stack {
   private readonly ebsCsiDriverAddonRole: Role;
   private readonly sampleAppRole: Role;
   private readonly cloudwatchAddonRole: Role;
+  private readonly rumIdentityPoolId: string;
+  private readonly rumAppMonitorId: string;
 
   // Constructs generated in this stack
   private readonly cluster: Cluster;
@@ -62,9 +67,11 @@ export class EksStack extends Stack {
   constructor(scope: Construct, id: string, props: EksStackProps) {
     super(scope, id, props);
 
-    const { vpc, eksClusterRoleProp, eksNodeGroupRoleProp, ebsCsiAddonRoleProp, sampleAppRoleProp, cloudwatchAddonRoleProp, rdsClusterEndpoint, rdsSecurityGroupId } = props;
+    const { vpc, eksClusterRoleProp, eksNodeGroupRoleProp, ebsCsiAddonRoleProp, sampleAppRoleProp, cloudwatchAddonRoleProp, rdsClusterEndpoint, rdsSecurityGroupId, awsApplicationTag, rumIdentityPoolId, rumAppMonitorId } = props;
     this.vpc = vpc;
     this.rdsClusterEndpoint = rdsClusterEndpoint;
+    this.rumIdentityPoolId = rumIdentityPoolId;
+    this.rumAppMonitorId = rumAppMonitorId;
     this.rdsSecurityGroup = SecurityGroup.fromSecurityGroupId(
       this,
       'ImportedRdsSecurityGroup',
@@ -79,7 +86,7 @@ export class EksStack extends Stack {
     this.cloudwatchAddonRole = new Role(this, 'CloduwatchAddonRole', cloudwatchAddonRoleProp);
 
     // Create EKS Cluster
-    this.cluster = this.createEksCluster();
+    this.cluster = this.createEksCluster(awsApplicationTag);
     // Add the Cloduwatch Addon
     this.cloudwatchAddon = this.addCloudwatchAddon();
     // Add the Ebs Csi Driver Addon
@@ -106,7 +113,7 @@ export class EksStack extends Stack {
     this.deployManifests(this.trafficGeneratorManifestPath,  [this.sampleAppNamespace, ...this.nginxIngressManifests, this.ingressExternalIp]);
   }
 
-  createEksCluster() {
+  createEksCluster(awsApplicationTag: string) {
     const cluster = new Cluster(this, 'EKSCluster', {
       clusterName: this.CLUSTER_NAME, 
       version: this.clusterKubernetesVersion,
@@ -115,6 +122,7 @@ export class EksStack extends Stack {
       defaultCapacity: 0,
       // Make sure this version matches the this.clusterKubernetesVersion
       kubectlLayer: new KubectlV31Layer(this, 'kubectl'),
+      tags: {"awsApplication": awsApplicationTag}
     });
 
     // Retrieve the latest node group ami. This will ensure that the ami doesn't expire for long live instances
@@ -130,8 +138,8 @@ export class EksStack extends Stack {
       instanceTypes: [
         new InstanceType('m5.large'),
       ],
-      minSize: 3, 
-      maxSize: 5,
+      minSize: 5, 
+      maxSize: 10,
       releaseVersion: nodeGroupAmiReleaseVersion,
     });
 
@@ -202,7 +210,7 @@ export class EksStack extends Stack {
     manifestFiles.forEach((file) => {
       const filePath = path.join(manifestPath, file);
       const yamlFile = readYamlFile(filePath);
-      const transformedYamlFile = transformYaml(yamlFile, this.account, this.region, this.SAMPLE_APP_NAMESPACE, this.ingressExternalIp?.value, this.rdsClusterEndpoint);
+      const transformedYamlFile = transformYaml(yamlFile, this.account, this.region, this.SAMPLE_APP_NAMESPACE, this.ingressExternalIp?.value, this.rdsClusterEndpoint, this.rumIdentityPoolId, this.rumAppMonitorId);
       const manifest = this.cluster.addManifest(transformNameToId(file), ...transformedYamlFile);
 
       dependencies.forEach((dependnecy) => {
@@ -234,26 +242,80 @@ export class EksStack extends Stack {
 
   // The role name is required as a parameter because cdk cannot resovlve the rolename of the role at synthesis time
   addFederatedPrincipal(role: Role, roleName: string, isServiceAccount: boolean) {
-    const openIdConnectProviderIssuer = this.cluster.openIdConnectProvider.openIdConnectProviderIssuer;
-    const stringCondition = new CfnJson(this, `${roleName}OidcCondition`, {
+    const openIdConnectProviderIssuer = this.cluster.openIdConnectProvider.openIdConnectProviderArn;
+    
+    // If this is not a service account, use the original approach with a single condition
+    if (!isServiceAccount) {
+      const stringCondition = new CfnJson(this, `${roleName}OidcCondition`, {
+        value: {
+          [`${this.cluster.openIdConnectProvider.openIdConnectProviderIssuer}:aud`]: 'sts.amazonaws.com',
+        },
+      });
+
+      const federatedPrincipal = new FederatedPrincipal(
+        this.cluster.openIdConnectProvider.openIdConnectProviderArn,
+        {
+          'StringEquals': stringCondition,
+        },
+        'sts:AssumeRoleWithWebIdentity'
+      )
+    
+      role.assumeRolePolicy?.addStatements(
+        new PolicyStatement({
+          effect: Effect.ALLOW,
+          principals: [federatedPrincipal],
+          actions: ['sts:AssumeRoleWithWebIdentity'],
+        })
+      );
+      return;
+    }
+    
+    // For service accounts, create separate trust relationships for each service account
+    
+    // Add trust policy for the visits service account
+    const visitsCondition = new CfnJson(this, `${roleName}VisitsOidcCondition`, {
       value: {
-        [`${openIdConnectProviderIssuer}:aud`]: 'sts.amazonaws.com',
-        ...(isServiceAccount? { [`${openIdConnectProviderIssuer}:sub`]: `system:serviceaccount:${this.SAMPLE_APP_NAMESPACE}:${this.VISITS_SERVICE_ACCOUNT_NAME}` }: {}),
+        [`${this.cluster.openIdConnectProvider.openIdConnectProviderIssuer}:aud`]: 'sts.amazonaws.com',
+        [`${this.cluster.openIdConnectProvider.openIdConnectProviderIssuer}:sub`]: `system:serviceaccount:${this.SAMPLE_APP_NAMESPACE}:${this.VISITS_SERVICE_ACCOUNT_NAME}`,
       },
     });
-
-    const federatedPrincipal = new FederatedPrincipal(
+    
+    const visitsPrincipal = new FederatedPrincipal(
       this.cluster.openIdConnectProvider.openIdConnectProviderArn,
       {
-        'StringEquals': stringCondition,
+        'StringEquals': visitsCondition,
       },
       'sts:AssumeRoleWithWebIdentity'
-    )
-  
+    );
+    
     role.assumeRolePolicy?.addStatements(
       new PolicyStatement({
         effect: Effect.ALLOW,
-        principals: [federatedPrincipal],
+        principals: [visitsPrincipal],
+        actions: ['sts:AssumeRoleWithWebIdentity'],
+      })
+    );
+    
+    // Add trust policy for the otel collector service account
+    const otelCondition = new CfnJson(this, `${roleName}OtelOidcCondition`, {
+      value: {
+        [`${this.cluster.openIdConnectProvider.openIdConnectProviderIssuer}:aud`]: 'sts.amazonaws.com',
+        [`${this.cluster.openIdConnectProvider.openIdConnectProviderIssuer}:sub`]: `system:serviceaccount:${this.SAMPLE_APP_NAMESPACE}:${this.OTEL_COLLECTOR_SERVICE_ACCOUNT_NAME}`,
+      },
+    });
+    
+    const otelPrincipal = new FederatedPrincipal(
+      this.cluster.openIdConnectProvider.openIdConnectProviderArn,
+      {
+        'StringEquals': otelCondition,
+      },
+      'sts:AssumeRoleWithWebIdentity'
+    );
+    
+    role.assumeRolePolicy?.addStatements(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        principals: [otelPrincipal],
         actions: ['sts:AssumeRoleWithWebIdentity'],
       })
     );

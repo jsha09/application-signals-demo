@@ -4,7 +4,7 @@ metadata:
   name: payment-service-dotnet
   namespace: namespace
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       io.kompose.service: payment-service-dotnet
@@ -34,6 +34,14 @@ spec:
               value: "true"
             - name: eureka__instance__port
               value: "8089"
+            - name: eureka__client__eurekaServerConnectTimeoutSeconds
+              value: "30"
+            - name: eureka__client__eurekaServerReadTimeoutSeconds
+              value: "30"
+            - name: eureka__client__registryFetchIntervalSeconds
+              value: "30"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: Application=Payment,Team=RevenueTeam,Tier=Tier-1,aws.application_signals.metric_resource_keys=Application&Team&Tier
 
           ports:
             - containerPort: 8089
@@ -42,7 +50,8 @@ spec:
             httpGet:
               path: /healthz
               port: 8089
-            initialDelaySeconds: 10
+            initialDelaySeconds: 30
             periodSeconds: 60
+            timeoutSeconds: 30
 
       restartPolicy: Always

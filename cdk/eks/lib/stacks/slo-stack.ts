@@ -1,12 +1,15 @@
 import { Construct } from 'constructs';
-import { aws_applicationsignals as applicationsignals, Stack, StackProps } from 'aws-cdk-lib';
+import { aws_applicationsignals as applicationsignals, Stack, StackProps, Tag } from 'aws-cdk-lib';
 import { AwsCustomResource, AwsCustomResourcePolicy, PhysicalResourceId } from 'aws-cdk-lib/custom-resources';
 import { PolicyStatement } from 'aws-cdk-lib/aws-iam';
+import {CfnServiceLevelObjective} from "aws-cdk-lib/aws-applicationsignals";
+import ExclusionWindowProperty = CfnServiceLevelObjective.ExclusionWindowProperty;
 
 
 interface SloProps extends StackProps {
     eksClusterName: string,
     sampleAppNamespace: string,
+    awsApplicationTag: string,
   }
 
 export class SloStack extends Stack {
@@ -18,7 +21,7 @@ export class SloStack extends Stack {
   constructor(scope: Construct, id: string, props: SloProps) {
     super(scope, id, props);
 
-    const { eksClusterName, sampleAppNamespace } = props;
+    const { eksClusterName, sampleAppNamespace, awsApplicationTag } = props;
 
     this.eksClusterName = eksClusterName;
     this.sampleAppNamespace = sampleAppNamespace
@@ -49,7 +52,8 @@ export class SloStack extends Stack {
         "GET",
         "AVAILABILITY",
         99.0,
-        "GreaterThan"
+        "GreaterThan",
+        awsApplicationTag,
     ));
     const getOwner99LatencySlo = new applicationsignals.CfnServiceLevelObjective(this, 'getOwner99LatencySLO', this.getSloProp(
         "Latency for Searching an Owner",
@@ -58,6 +62,7 @@ export class SloStack extends Stack {
         "LATENCY",
         200.0,
         "LessThan",
+        awsApplicationTag,
         "p99"
     ));
     const postOwner99AvailabilitySlo = new applicationsignals.CfnServiceLevelObjective(this, 'postOwner99AvailabilitySLO', this.getSloProp(
@@ -66,7 +71,8 @@ export class SloStack extends Stack {
         "POST",
         "AVAILABILITY",
         99.0,
-        "GreaterThan"
+        "GreaterThan",
+        awsApplicationTag,
     ));
     const postOwner99LatencySlo = new applicationsignals.CfnServiceLevelObjective(this, 'postOwner99LatencySLO', this.getSloProp(
         "Latency for Registering an Owner",
@@ -75,30 +81,58 @@ export class SloStack extends Stack {
         "LATENCY",
         2000.0,
         "LessThan",
+        awsApplicationTag,
         "p99"
     ));
     const billingActivitiesLatencySlo = new applicationsignals.CfnServiceLevelObjective(this, 'billingActivitiesLatencySLO', this.getSloProp(
-        "Latency for Billing Activities",
-        "Latency P99 less than 500 ms for GET Billing Activities operation",
+        "Latency of billing activities",
+        "Latency P99 less than 300 ms for GET Billing Activities operation",
         "GET",
         "LATENCY",
-        500.0,
+        300.0,
         "LessThan",
+        awsApplicationTag,
         "p99",
-        "/api/billing/billings",
+        "^billings/$",
         "billing-service-python"
     ));
-    const appointmentServiceAvailabilitySlo = new applicationsignals.CfnServiceLevelObjective(this, 'appointmentServiceAvailabilitySLO', this.getSloProp(
-        "Availability for Appointment Service",
-        "Availability larger than 99 for Appointment Service operations",
-        "",
+
+    const exclusionWindows: ExclusionWindowProperty[] = [{
+         window: {
+             duration: 16,
+             durationUnit: 'HOUR',
+         },
+         recurrenceRule: {
+             expression: 'cron(0 17 ? * *)',
+         }
+    }]
+    const getPaymentAvailabilitySlo = new applicationsignals.CfnServiceLevelObjective(this, 'getPaymentAvailabilitySLO', this.getSloProp(
+        "Availability for Retrieving Payments",
+        "Availability larger than 99 for Get Payment operation",
+        "GET",
         "AVAILABILITY",
         99.0,
         "GreaterThan",
+        awsApplicationTag,
         undefined,
-        "",
-        "appointment-service",
-        "Lambda"
+        "/owners/{ownerId:int}/pets/{petId:int}/payments",
+        "payment-service-dotnet",
+        undefined,
+        //exclusionWindows
+        undefined
+    ));
+    
+    const appointmentServiceAvailabilitySlo = new applicationsignals.CfnServiceLevelObjective(this, 'appointmentServiceAvailabilitySLO', this.getLambdaServiceSloProp(
+        "appointment service availability",
+        "Availability for appointment-service-get/FunctionHandler operation",
+        awsApplicationTag
+    ));
+
+    const auditServiceAvailabilitySlo = new applicationsignals.CfnServiceLevelObjective(this, 'auditServiceAvailabilitySLO', this.getLambdaServiceSloProp(
+        "audit service availability",
+        "Availability for audit-service/FunctionHandler operation",
+        awsApplicationTag,
+        "audit-service"
     ));
 
     getOwner99AvailabilitySlo.node.addDependency(enableTopologyDiscovery);
@@ -106,10 +140,12 @@ export class SloStack extends Stack {
     postOwner99AvailabilitySlo.node.addDependency(enableTopologyDiscovery);
     postOwner99LatencySlo.node.addDependency(enableTopologyDiscovery);
     billingActivitiesLatencySlo.node.addDependency(enableTopologyDiscovery);
+    getPaymentAvailabilitySlo.node.addDependency(enableTopologyDiscovery);
     appointmentServiceAvailabilitySlo.node.addDependency(enableTopologyDiscovery);
+    auditServiceAvailabilitySlo.node.addDependency(enableTopologyDiscovery);
   }
   
-  getSloProp(name: string, description: string, requestType: string, metricType: string, metricThreshold: number, comparisonOperator: string, statistic?: string, operationPath?: string, serviceName?: string, serviceType?: string) {
+  getSloProp(name: string, description: string, requestType: string, metricType: string, metricThreshold: number, comparisonOperator: string, awsApplicationTag: string, statistic?: string, operationPath?: string, serviceName?: string, serviceType?: string, exclusionWindows?: ExclusionWindowProperty[]) {
     // Default values
     const path = operationPath || '/api/customer/owners';
     const service = serviceName || this.serviceName;
@@ -128,7 +164,7 @@ export class SloStack extends Stack {
                     "Name": service,
                     "Type": type
                 },
-                operationName: type === 'Lambda' ? undefined : `${requestType}${path}`,
+                operationName: type === 'Lambda' ? undefined : `${requestType} ${path}`,
                 metricType: metricType,
                 statistic: statistic,
                 periodSeconds: 60
@@ -145,8 +181,49 @@ export class SloStack extends Stack {
             },
             attainmentGoal: 99.9,
             warningThreshold: 60.0,
-          }
+          },
+          tags: [
+            new Tag("awsApplication", awsApplicationTag)
+          ],
+          exclusionWindows: exclusionWindows
     }
     return sloProp
   }
+
+  getLambdaServiceSloProp(name: string, description: string, awsApplicationTag: string, serviceName: string = "appointment-service-get") {
+    const sloProp: applicationsignals.CfnServiceLevelObjectiveProps = {
+        name: name, 
+        description: description,
+        sli: {
+            sliMetric: {
+                keyAttributes: {
+                    "Name": serviceName,
+                    "Type": "Service",
+                    "Environment": "lambda:default"
+                },
+                operationName: `${serviceName}/FunctionHandler`,
+                metricType: "AVAILABILITY",
+                periodSeconds: 60
+            },
+            metricThreshold: 95.0,
+            comparisonOperator: "GreaterThan",
+          },
+          goal: {
+            interval: {
+                rollingInterval: {
+                    duration: 1,
+                    durationUnit: "DAY",
+                }
+            },
+            attainmentGoal: 95.0,
+            warningThreshold: 30.0,
+          },
+          tags: [
+            new Tag("awsApplication", awsApplicationTag)
+          ]
+    }
+    return sloProp
+  }
+
+
 }
